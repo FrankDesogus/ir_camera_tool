@@ -5,6 +5,7 @@ import cv2
 import numpy as np
 
 from nvf_reader import import_nvf
+from roi import ROIManager, calculate_roi_timeseries, plot_roi_timeseries
 
 
 WINDOW_NAME = "NVF Viewer"
@@ -137,13 +138,25 @@ def prepare_frame_for_display(
     return display, low, high
 
 
+def _check_roi_range(rois: list, p_start: int, p_end: int) -> bool:
+    """Valida le precondizioni per calcolare/plottare le timeseries.
+    Stampa un messaggio e restituisce False se qualcosa non va."""
+    if not rois:
+        print("Nessuna ROI selezionata.")
+        return False
+    if p_end < p_start:
+        print(f"Intervallo non valido: Plot start={p_start}, Plot end={p_end}.")
+        return False
+    return True
+
+
 def main() -> None:
     nvf = import_nvf()
     data_cube = nvf.data_cube
 
     # Adatta qui se il cubo reale è (H, W, N) invece di (N, H, W)
     # Nel dubbio controlla bene questa parte.
-    n_frames = data_cube.shape[0]
+    n_frames, frame_height, frame_width = data_cube.shape
 
     # Statistiche globali per modalità GLOBAL
     global_min_raw = float(np.min(data_cube))
@@ -158,6 +171,9 @@ def main() -> None:
         global_high = global_low + 1.0
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+
+    roi_manager = ROIManager(frame_width, frame_height)
+    cv2.setMouseCallback(WINDOW_NAME, roi_manager.handle_mouse)
 
     cv2.createTrackbar("Frame", WINDOW_NAME, 0, max(n_frames - 1, 1), nothing)
     cv2.createTrackbar("Play", WINDOW_NAME, 0, 1, nothing)
@@ -176,8 +192,14 @@ def main() -> None:
     cv2.createTrackbar("Manual low", WINDOW_NAME, 0, 1000, nothing)
     cv2.createTrackbar("Manual high", WINDOW_NAME, 1000, 1000, nothing)
 
+    # Intervallo frame per il calcolo/plot delle ROI (estremi inclusi)
+    _tb_max = max(n_frames - 1, 1)
+    cv2.createTrackbar("Plot start", WINDOW_NAME, 0,            _tb_max, nothing)
+    cv2.createTrackbar("Plot end",   WINDOW_NAME, n_frames - 1, _tb_max, nothing)
+
     current_frame = 0
     last_time = time.time()
+    _clear_confirm_at: float = 0.0
 
     while True:
         play = cv2.getTrackbarPos("Play", WINDOW_NAME)
@@ -191,6 +213,10 @@ def main() -> None:
                 last_time = now
         else:
             current_frame = cv2.getTrackbarPos("Frame", WINDOW_NAME)
+
+        # Clamp difensivo: evita IndexError se la trackbar supera l'indice valido
+        # (può succedere con file a singolo frame dove _tb_max=1 ma n_frames=1).
+        current_frame = min(current_frame, n_frames - 1)
 
         transform_mode = mode_from_trackbar(cv2.getTrackbarPos("Mode 0L 1S 2G", WINDOW_NAME))
         scale_mode = scale_mode_from_trackbar(cv2.getTrackbarPos("Scale 0A 1G 2M", WINDOW_NAME))
@@ -208,6 +234,9 @@ def main() -> None:
 
         manual_low = global_min_raw + low_slider * (global_max_raw - global_min_raw)
         manual_high = global_min_raw + high_slider * (global_max_raw - global_min_raw)
+
+        p_start = cv2.getTrackbarPos("Plot start", WINDOW_NAME)
+        p_end   = cv2.getTrackbarPos("Plot end",   WINDOW_NAME)
 
         raw_frame = data_cube[current_frame]
         # Se necessario:
@@ -231,13 +260,25 @@ def main() -> None:
 
         overlay = cv2.cvtColor(display_frame, cv2.COLOR_GRAY2BGR)
 
-        text_1 = f"Frame {current_frame + 1}/{n_frames}"
-        text_2 = f"Mode: {mode_name} | Scale: {scale_name} | Gamma: {gamma:.2f}"
-        text_3 = f"Window: {used_low:.2f} -> {used_high:.2f}"
+        hud_info_1 = (
+            f"Frame {current_frame + 1}/{n_frames}"
+            f"  |  {mode_name}  |  {scale_name}  |  Gamma: {gamma:.2f}"
+        )
+        roi_shape = "SQ" if roi_manager.square_mode else "RECT"
+        hud_info_2 = (
+            f"Win: {used_low:.1f} -> {used_high:.1f}"
+            f"  |  ROI: {len(roi_manager.rois)} [{roi_shape}]"
+            f"  |  Plot: {p_start}..{p_end}"
+        )
+        hud_keys_1 = "SPACE=play/pause | A/D=prev/next | Z=undo ROI | C=clear ROI"
+        hud_keys_2 = "drag/click=add ROI | R=rect | S=square | T=stats | G=plot | Q/ESC=quit"
 
-        cv2.putText(overlay, text_1, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(overlay, text_2, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(overlay, text_3, (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(overlay, hud_info_1, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6,  (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(overlay, hud_info_2, (10, 43), cv2.FONT_HERSHEY_SIMPLEX, 0.6,  (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(overlay, hud_keys_1, (10, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 200, 200), 1, cv2.LINE_AA)
+        cv2.putText(overlay, hud_keys_2, (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 200, 200), 1, cv2.LINE_AA)
+
+        overlay = roi_manager.draw_on_frame(overlay)
 
         cv2.imshow(WINDOW_NAME, overlay)
 
@@ -254,6 +295,45 @@ def main() -> None:
         elif key == ord("d"):
             current_frame = min(n_frames - 1, current_frame + 1)
             cv2.setTrackbarPos("Frame", WINDOW_NAME, current_frame)
+        elif key == ord("z"):
+            roi_manager.remove_last()
+        elif key == ord("c"):
+            if roi_manager.rois and time.time() - _clear_confirm_at < 2.0:
+                roi_manager.clear()
+                _clear_confirm_at = 0.0
+                print("Tutte le ROI cancellate.")
+            elif roi_manager.rois:
+                _clear_confirm_at = time.time()
+                print(f"Premi C ancora entro 2s per cancellare {len(roi_manager.rois)} ROI.")
+        elif key == ord("r"):
+            roi_manager.square_mode = False
+        elif key == ord("s"):
+            roi_manager.square_mode = True
+        elif key == ord("t"):
+            if _check_roi_range(roi_manager.rois, p_start, p_end):
+                timeseries = calculate_roi_timeseries(
+                    data_cube, roi_manager.rois, p_start, p_end + 1
+                )
+                for name, ts in timeseries.items():
+                    first_vals = ", ".join(f"{v:.2f}" for v in ts[:5])
+                    print(f"\n{name}  [frame {p_start}..{p_end}]")
+                    print(f"  samples:      {len(ts)}")
+                    print(f"  min:          {ts.min():.2f}")
+                    print(f"  max:          {ts.max():.2f}")
+                    print(f"  mean:         {ts.mean():.2f}")
+                    print(f"  first values: [{first_vals}]")
+        elif key == ord("g"):
+            if _check_roi_range(roi_manager.rois, p_start, p_end):
+                timeseries = calculate_roi_timeseries(
+                    data_cube, roi_manager.rois, p_start, p_end + 1
+                )
+                colors = {roi.name: roi.color for roi in roi_manager.rois}
+                plot_roi_timeseries(
+                    timeseries,
+                    start_frame=p_start,
+                    colors=colors,
+                    current_frame=current_frame,
+                )
 
     cv2.destroyAllWindows()
 
