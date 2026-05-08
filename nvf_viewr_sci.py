@@ -6,141 +6,18 @@ import numpy as np
 
 from nvf_reader import import_nvf
 from roi import ROIManager, calculate_roi_timeseries, plot_roi_timeseries
+from display_pipeline import prepare_frame_for_display, mode_from_value, scale_mode_from_value
 
 
 WINDOW_NAME = "NVF Viewer"
+CONTROLS_WINDOW = "Display Controls"
 
 
 def nothing(_: int) -> None:
     pass
 
 
-def percentile_window(frame: np.ndarray, p_min: float, p_max: float) -> tuple[float, float]:
-    """
-    Restituisce low/high dai percentili del frame.
-    """
-    if p_min >= p_max:
-        p_max = min(p_min + 0.1, 100.0)
-
-    low = float(np.percentile(frame, p_min))
-    high = float(np.percentile(frame, p_max))
-
-    if high <= low:
-        high = low + 1.0
-
-    return low, high
-
-
-def normalize_with_window(frame: np.ndarray, low: float, high: float) -> np.ndarray:
-    """
-    Porta il frame in [0,1] usando una finestra low/high fissata.
-    Qui NON si fa una seconda normalizzazione dopo le trasformazioni.
-    """
-    frame_f = frame.astype(np.float32)
-    norm = (frame_f - low) / (high - low)
-    return np.clip(norm, 0.0, 1.0)
-
-
-def apply_display_transform(norm_frame: np.ndarray, mode: int, gamma: float = 1.0) -> np.ndarray:
-    """
-    norm_frame deve essere già in [0,1].
-
-    mode:
-    0 = linear
-    1 = sqrt
-    2 = log
-    """
-    x = np.clip(norm_frame.astype(np.float32), 0.0, 1.0)
-
-    if mode == 0:
-        y = x
-    elif mode == 1:
-        y = np.sqrt(x)
-    elif mode == 2:
-        alpha = 9.0
-        y = np.log1p(alpha * x) / np.log1p(alpha)
-    else:
-        y = x
-
-    # Gamma opzionale come rifinitura controllata
-    gamma = max(gamma, 1e-6)
-    y = np.power(y, gamma)
-
-    return np.clip(y, 0.0, 1.0)
-
-
-def to_uint8(norm_frame: np.ndarray) -> np.ndarray:
-    """
-    Converte un frame in [0,1] a uint8 solo per il display.
-    """
-    return (norm_frame * 255.0).round().clip(0, 255).astype(np.uint8)
-
-
-def mode_from_trackbar(value: int) -> int:
-    if value <= 0:
-        return 0
-    if value == 1:
-        return 1
-    return 2
-
-
-def scale_mode_from_trackbar(value: int) -> int:
-    """
-    0 = AUTO   (percentili sul frame corrente)
-    1 = GLOBAL (percentili sul cubo intero)
-    2 = MANUAL (low/high scelti dall'utente)
-    """
-    if value <= 0:
-        return 0
-    if value == 1:
-        return 1
-    else:
-        return 2
-
-
-def prepare_frame_for_display(
-    raw_frame: np.ndarray,
-    transform_mode: int,
-    scale_mode: int,
-    p_min: float,
-    p_max: float,
-    global_low: float,
-    global_high: float,
-    manual_low: float,
-    manual_high: float,
-    gamma: float,
-) -> tuple[np.ndarray, float, float]:
-    """
-    Pipeline corretta per display scientificamente interpretabile:
-
-    raw -> scelta finestra low/high -> normalizzazione [0,1]
-        -> transform (linear/sqrt/log) -> gamma opzionale
-        -> uint8
-
-    Restituisce:
-    - frame uint8 per display
-    - low usato
-    - high usato
-    """
-    if scale_mode == 0:  # AUTO
-        low, high = percentile_window(raw_frame, p_min, p_max)
-    elif scale_mode == 1:  # GLOBAL
-        low, high = global_low, global_high
-    else:  # MANUAL
-        low, high = manual_low, manual_high
-        if high <= low:
-            high = low + 1.0
-
-    norm = normalize_with_window(raw_frame, low, high)
-    transformed = apply_display_transform(norm, transform_mode, gamma=gamma)
-    display = to_uint8(transformed)
-
-    return display, low, high
-
-
 def _check_roi_range(rois: list, p_start: int, p_end: int) -> bool:
-    """Valida le precondizioni per calcolare/plottare le timeseries.
-    Stampa un messaggio e restituisce False se qualcosa non va."""
     if not rois:
         print("Nessuna ROI selezionata.")
         return False
@@ -150,56 +27,68 @@ def _check_roi_range(rois: list, p_start: int, p_end: int) -> bool:
     return True
 
 
+def print_help() -> None:
+    print(
+        "\n=== NVF Viewer — tasti ===\n"
+        "  SPACE      play / pausa\n"
+        "  A / D      frame precedente / successivo\n"
+        "  R          modalità ROI rettangolare\n"
+        "  S          modalità ROI quadrata\n"
+        "  Z          annulla ultima ROI\n"
+        "  C          cancella tutte le ROI (conferma premendo C di nuovo entro 2s)\n"
+        "  T          stampa statistiche ROI sull'intervallo selezionato\n"
+        "  G          mostra grafico ROI sull'intervallo selezionato\n"
+        "  H          mostra di nuovo questo aiuto\n"
+        "  Q / ESC    esci\n"
+        "\nControlli display: finestra 'Display Controls'\n"
+        "  Mode:  0=Linear  1=Sqrt  2=Log  3=Asinh\n"
+        "  Scale: 0=Auto    1=Global  2=Manual\n"
+        "=========================\n"
+    )
+
+
 def main() -> None:
     nvf = import_nvf()
     data_cube = nvf.data_cube
 
-    # Adatta qui se il cubo reale è (H, W, N) invece di (N, H, W)
-    # Nel dubbio controlla bene questa parte.
     n_frames, frame_height, frame_width = data_cube.shape
 
-    # Statistiche globali per modalità GLOBAL
     global_min_raw = float(np.min(data_cube))
     global_max_raw = float(np.max(data_cube))
 
-    # Percentili globali più robusti del min/max assoluto
-    global_pmin_default = 1.0
-    global_pmax_default = 99.0
-    global_low = float(np.percentile(data_cube, global_pmin_default))
-    global_high = float(np.percentile(data_cube, global_pmax_default))
+    global_low = float(np.percentile(data_cube, 1.0))
+    global_high = float(np.percentile(data_cube, 99.0))
     if global_high <= global_low:
         global_high = global_low + 1.0
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.namedWindow(CONTROLS_WINDOW, cv2.WINDOW_NORMAL)
 
     roi_manager = ROIManager(frame_width, frame_height)
     cv2.setMouseCallback(WINDOW_NAME, roi_manager.handle_mouse)
 
-    cv2.createTrackbar("Frame", WINDOW_NAME, 0, max(n_frames - 1, 1), nothing)
-    cv2.createTrackbar("Play", WINDOW_NAME, 0, 1, nothing)
-    cv2.createTrackbar("FPS", WINDOW_NAME, 25, 100, nothing)
-
-    cv2.createTrackbar("Mode 0L 1S 2G", WINDOW_NAME, 0, 2, nothing)
-    cv2.createTrackbar("Scale 0A 1G 2M", WINDOW_NAME, 0, 2, nothing)
-
-    cv2.createTrackbar("Min % x10", WINDOW_NAME, 10, 999, nothing)      # default 1.0%
-    cv2.createTrackbar("Max % x10", WINDOW_NAME, 990, 1000, nothing)    # default 99.0%
-
-    # Gamma x100: 100 = gamma 1.00
-    cv2.createTrackbar("Gamma x100", WINDOW_NAME, 100, 300, nothing)
-
-    # Manual low/high controllati via slider 0..1000 e mappati sul range raw globale
-    cv2.createTrackbar("Manual low", WINDOW_NAME, 0, 1000, nothing)
-    cv2.createTrackbar("Manual high", WINDOW_NAME, 1000, 1000, nothing)
-
-    # Intervallo frame per il calcolo/plot delle ROI (estremi inclusi)
+    # --- Finestra principale: playback e plot range ---
+    cv2.createTrackbar("Frame",      WINDOW_NAME, 0,            max(n_frames - 1, 1), nothing)
+    cv2.createTrackbar("Play",       WINDOW_NAME, 0,            1,                    nothing)
+    cv2.createTrackbar("FPS",        WINDOW_NAME, 25,           100,                  nothing)
     _tb_max = max(n_frames - 1, 1)
-    cv2.createTrackbar("Plot start", WINDOW_NAME, 0,            _tb_max, nothing)
-    cv2.createTrackbar("Plot end",   WINDOW_NAME, n_frames - 1, _tb_max, nothing)
+    cv2.createTrackbar("Plot start", WINDOW_NAME, 0,            _tb_max,              nothing)
+    cv2.createTrackbar("Plot end",   WINDOW_NAME, n_frames - 1, _tb_max,              nothing)
+
+    # --- Finestra display: parametri di rendering ---
+    cv2.createTrackbar("Mode 0L 1S 2G 3A", CONTROLS_WINDOW, 0,    3,    nothing)
+    cv2.createTrackbar("Scale 0A 1G 2M",   CONTROLS_WINDOW, 0,    2,    nothing)
+    cv2.createTrackbar("Min % x10",        CONTROLS_WINDOW, 10,   999,  nothing)
+    cv2.createTrackbar("Max % x10",        CONTROLS_WINDOW, 990,  1000, nothing)
+    cv2.createTrackbar("Gamma x100",       CONTROLS_WINDOW, 100,  300,  nothing)
+    cv2.createTrackbar("Manual low",       CONTROLS_WINDOW, 0,    1000, nothing)
+    cv2.createTrackbar("Manual high",      CONTROLS_WINDOW, 1000, 1000, nothing)
 
     current_frame = 0
     last_time = time.time()
     _clear_confirm_at: float = 0.0
+
+    print_help()
 
     while True:
         play = cv2.getTrackbarPos("Play", WINDOW_NAME)
@@ -214,24 +103,18 @@ def main() -> None:
         else:
             current_frame = cv2.getTrackbarPos("Frame", WINDOW_NAME)
 
-        # Clamp difensivo: evita IndexError se la trackbar supera l'indice valido
-        # (può succedere con file a singolo frame dove _tb_max=1 ma n_frames=1).
         current_frame = min(current_frame, n_frames - 1)
 
-        transform_mode = mode_from_trackbar(cv2.getTrackbarPos("Mode 0L 1S 2G", WINDOW_NAME))
-        scale_mode = scale_mode_from_trackbar(cv2.getTrackbarPos("Scale 0A 1G 2M", WINDOW_NAME))
+        transform_mode = mode_from_value(cv2.getTrackbarPos("Mode 0L 1S 2G 3A", CONTROLS_WINDOW))
+        scale_mode = scale_mode_from_value(cv2.getTrackbarPos("Scale 0A 1G 2M", CONTROLS_WINDOW))
 
-        p_min = cv2.getTrackbarPos("Min % x10", WINDOW_NAME) / 10.0
-        p_max = cv2.getTrackbarPos("Max % x10", WINDOW_NAME) / 10.0
-        p_max = min(p_max, 100.0)
+        p_min = cv2.getTrackbarPos("Min % x10", CONTROLS_WINDOW) / 10.0
+        p_max = min(cv2.getTrackbarPos("Max % x10", CONTROLS_WINDOW) / 10.0, 100.0)
 
-        gamma = cv2.getTrackbarPos("Gamma x100", WINDOW_NAME) / 100.0
-        gamma = max(gamma, 0.01)
+        gamma = max(cv2.getTrackbarPos("Gamma x100", CONTROLS_WINDOW) / 100.0, 0.01)
 
-        # Mapping slider manuali su range raw globale
-        low_slider = cv2.getTrackbarPos("Manual low", WINDOW_NAME) / 1000.0
-        high_slider = cv2.getTrackbarPos("Manual high", WINDOW_NAME) / 1000.0
-
+        low_slider = cv2.getTrackbarPos("Manual low", CONTROLS_WINDOW) / 1000.0
+        high_slider = cv2.getTrackbarPos("Manual high", CONTROLS_WINDOW) / 1000.0
         manual_low = global_min_raw + low_slider * (global_max_raw - global_min_raw)
         manual_high = global_min_raw + high_slider * (global_max_raw - global_min_raw)
 
@@ -239,8 +122,6 @@ def main() -> None:
         p_end   = cv2.getTrackbarPos("Plot end",   WINDOW_NAME)
 
         raw_frame = data_cube[current_frame]
-        # Se necessario:
-        # raw_frame = raw_frame.T
 
         display_frame, used_low, used_high = prepare_frame_for_display(
             raw_frame=raw_frame,
@@ -255,28 +136,20 @@ def main() -> None:
             gamma=gamma,
         )
 
-        mode_name = {0: "LINEAR", 1: "SQRT", 2: "LOG"}[transform_mode]
-        scale_name = {0: "AUTO", 1: "GLOBAL", 2: "MANUAL"}[scale_mode]
+        mode_name  = {0: "LIN", 1: "SQRT", 2: "LOG", 3: "ASINH"}[transform_mode]
+        scale_name = {0: "AUTO", 1: "GLOB", 2: "MAN"}[scale_mode]
+        roi_shape  = "SQ" if roi_manager.square_mode else "RECT"
 
         overlay = cv2.cvtColor(display_frame, cv2.COLOR_GRAY2BGR)
 
-        hud_info_1 = (
-            f"Frame {current_frame + 1}/{n_frames}"
-            f"  |  {mode_name}  |  {scale_name}  |  Gamma: {gamma:.2f}"
+        hud = (
+            f"F{current_frame + 1}/{n_frames}"
+            f"  {mode_name} {scale_name} g{gamma:.2f}"
+            f"  {used_low:.1f}→{used_high:.1f}"
+            f"  ROI:{len(roi_manager.rois)}[{roi_shape}]"
+            f"  P:{p_start}-{p_end}"
         )
-        roi_shape = "SQ" if roi_manager.square_mode else "RECT"
-        hud_info_2 = (
-            f"Win: {used_low:.1f} -> {used_high:.1f}"
-            f"  |  ROI: {len(roi_manager.rois)} [{roi_shape}]"
-            f"  |  Plot: {p_start}..{p_end}"
-        )
-        hud_keys_1 = "SPACE=play/pause | A/D=prev/next | Z=undo ROI | C=clear ROI"
-        hud_keys_2 = "drag/click=add ROI | R=rect | S=square | T=stats | G=plot | Q/ESC=quit"
-
-        cv2.putText(overlay, hud_info_1, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6,  (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(overlay, hud_info_2, (10, 43), cv2.FONT_HERSHEY_SIMPLEX, 0.6,  (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(overlay, hud_keys_1, (10, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 200, 200), 1, cv2.LINE_AA)
-        cv2.putText(overlay, hud_keys_2, (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 200, 200), 1, cv2.LINE_AA)
+        cv2.putText(overlay, hud, (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
 
         overlay = roi_manager.draw_on_frame(overlay)
 
@@ -305,6 +178,8 @@ def main() -> None:
             elif roi_manager.rois:
                 _clear_confirm_at = time.time()
                 print(f"Premi C ancora entro 2s per cancellare {len(roi_manager.rois)} ROI.")
+        elif key == ord("h"):
+            print_help()
         elif key == ord("r"):
             roi_manager.square_mode = False
         elif key == ord("s"):
