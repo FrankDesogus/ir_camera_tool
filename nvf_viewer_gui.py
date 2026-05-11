@@ -40,62 +40,7 @@ from PySide6.QtWidgets import (
 
 from nvf_reader import NVFData, import_nvf
 from roi import ROI, ROIManager, calculate_roi_timeseries
-
-
-# ---------------------------------------------------------------------------
-# Display pipeline — pure functions duplicated from nvf_viewr_sci.py.
-# No import from that module to keep the two frontends fully independent.
-# ---------------------------------------------------------------------------
-
-def _percentile_window(frame: np.ndarray, p_min: float, p_max: float) -> tuple[float, float]:
-    if p_min >= p_max:
-        p_max = min(p_min + 0.1, 100.0)
-    low = float(np.percentile(frame, p_min))
-    high = float(np.percentile(frame, p_max))
-    if high <= low:
-        high = low + 1.0
-    return low, high
-
-
-def _normalize(frame: np.ndarray, low: float, high: float) -> np.ndarray:
-    return np.clip((frame.astype(np.float32) - low) / (high - low), 0.0, 1.0)
-
-
-def _transform(norm: np.ndarray, mode: int, gamma: float) -> np.ndarray:
-    x = np.clip(norm.astype(np.float32), 0.0, 1.0)
-    if mode == 1:
-        y = np.sqrt(x)
-    elif mode == 2:
-        alpha = 9.0
-        y = np.log1p(alpha * x) / np.log1p(alpha)
-    else:
-        y = x
-    return np.clip(np.power(y, max(gamma, 1e-6)), 0.0, 1.0)
-
-
-def _prepare_frame(
-    raw: np.ndarray,
-    transform_mode: int,
-    scale_mode: int,
-    p_min: float,
-    p_max: float,
-    global_low: float,
-    global_high: float,
-    manual_low: float,
-    manual_high: float,
-    gamma: float,
-) -> tuple[np.ndarray, float, float]:
-    if scale_mode == 0:
-        low, high = _percentile_window(raw, p_min, p_max)
-    elif scale_mode == 1:
-        low, high = global_low, global_high
-    else:
-        low, high = manual_low, manual_high
-        if high <= low:
-            high = low + 1.0
-    norm = _normalize(raw, low, high)
-    t = _transform(norm, transform_mode, gamma)
-    return (t * 255.0).round().clip(0, 255).astype(np.uint8), low, high
+from display_pipeline import prepare_frame_for_display
 
 
 # ---------------------------------------------------------------------------
@@ -342,14 +287,17 @@ class DisplayPanel(QWidget):
 
         # Transform mode
         self._mode_group = QButtonGroup(self)
-        rb_lin, rb_sqrt, rb_log = QRadioButton("Linear"), QRadioButton("Sqrt"), QRadioButton("Log")
+        rb_lin  = QRadioButton("Linear")
+        rb_sqrt = QRadioButton("Sqrt")
+        rb_log  = QRadioButton("Log")
+        rb_asinh = QRadioButton("Asinh")
         rb_lin.setChecked(True)
-        for i, rb in enumerate([rb_lin, rb_sqrt, rb_log]):
+        for i, rb in enumerate([rb_lin, rb_sqrt, rb_log, rb_asinh]):
             self._mode_group.addButton(rb, i)
         self._mode_group.idToggled.connect(
             lambda _id, chk: self.params_changed.emit() if chk else None
         )
-        mode_row = self._hrow(rb_lin, rb_sqrt, rb_log)
+        mode_row = self._hrow(rb_lin, rb_sqrt, rb_log, rb_asinh)
 
         # Scale mode
         self._scale_group = QButtonGroup(self)
@@ -817,13 +765,17 @@ class MainWindow(QMainWindow):
         p   = self._display_panel.get_params()
         raw = self._data_cube[self._cur_frame]
 
-        uint8, used_low, used_high = _prepare_frame(
-            raw,
-            p["transform_mode"], p["scale_mode"],
-            p["p_min"], p["p_max"],
-            self._glob_low, self._glob_high,
-            p["manual_low"], p["manual_high"],
-            p["gamma"],
+        uint8, used_low, used_high = prepare_frame_for_display(
+            raw_frame=raw,
+            transform_mode=p["transform_mode"],
+            scale_mode=p["scale_mode"],
+            p_min=p["p_min"],
+            p_max=p["p_max"],
+            global_low=self._glob_low,
+            global_high=self._glob_high,
+            manual_low=p["manual_low"],
+            manual_high=p["manual_high"],
+            gamma=p["gamma"],
         )
         # Grayscale → BGR so roi_manager.draw_on_frame can paint colored boxes
         bgr = cv2.cvtColor(uint8, cv2.COLOR_GRAY2BGR)
