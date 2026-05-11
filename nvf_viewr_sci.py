@@ -31,42 +31,46 @@ def percentile_window(frame: np.ndarray, p_min: float, p_max: float) -> tuple[fl
     return low, high
 
 
-def normalize_with_window(frame: np.ndarray, low: float, high: float) -> np.ndarray:
-    """
-    Porta il frame in [0,1] usando una finestra low/high fissata.
-    Qui NON si fa una seconda normalizzazione dopo le trasformazioni.
-    """
+def clipping(frame: np.ndarray, low: float, high: float) -> np.ndarray:
     frame_f = frame.astype(np.float32)
-    norm = (frame_f - low) / (high - low)
-    return np.clip(norm, 0.0, 1.0)
+    clipped = frame_f - low
+    lim_sup = high - low
+    return np.clip(clipped, 0, lim_sup)
 
 
-def apply_display_transform(norm_frame: np.ndarray, mode: int, gamma: float = 1.0) -> np.ndarray:
+def apply_display_transform(frame: np.ndarray, mode: int, gamma: float = 1.0) -> np.ndarray:
     """
-    norm_frame deve essere già in [0,1].
-
     mode:
     0 = linear
     1 = sqrt
     2 = log
+    3 = asinh
     """
-    x = np.clip(norm_frame.astype(np.float32), 0.0, 1.0)
+    x = frame.astype(np.float32)
 
     if mode == 0:
         y = x
     elif mode == 1:
         y = np.sqrt(x)
     elif mode == 2:
-        alpha = 9.0
-        y = np.log1p(alpha * x) / np.log1p(alpha)
+        y = np.log1p(x)
+    elif mode == 3:
+        y = np.arcsinh(x)
     else:
         y = x
 
-    # Gamma opzionale come rifinitura controllata
     gamma = max(gamma, 1e-6)
     y = np.power(y, gamma)
 
-    return np.clip(y, 0.0, 1.0)
+    return y
+
+
+def normalize(frame: np.ndarray) -> np.ndarray:
+    frame_f = frame.astype(np.float32)
+    max_val = frame_f.max()
+    if max_val == 0:
+        return frame_f
+    return frame_f / max_val
 
 
 def to_uint8(norm_frame: np.ndarray) -> np.ndarray:
@@ -81,7 +85,9 @@ def mode_from_trackbar(value: int) -> int:
         return 0
     if value == 1:
         return 1
-    return 2
+    if value == 2:
+        return 2
+    return 3
 
 
 def scale_mode_from_trackbar(value: int) -> int:
@@ -111,16 +117,7 @@ def prepare_frame_for_display(
     gamma: float,
 ) -> tuple[np.ndarray, float, float]:
     """
-    Pipeline corretta per display scientificamente interpretabile:
-
-    raw -> scelta finestra low/high -> normalizzazione [0,1]
-        -> transform (linear/sqrt/log) -> gamma opzionale
-        -> uint8
-
-    Restituisce:
-    - frame uint8 per display
-    - low usato
-    - high usato
+    raw -> scelta low/high -> clipping -> transform -> normalize -> uint8
     """
     if scale_mode == 0:  # AUTO
         low, high = percentile_window(raw_frame, p_min, p_max)
@@ -131,9 +128,10 @@ def prepare_frame_for_display(
         if high <= low:
             high = low + 1.0
 
-    norm = normalize_with_window(raw_frame, low, high)
-    transformed = apply_display_transform(norm, transform_mode, gamma=gamma)
-    display = to_uint8(transformed)
+    clipped = clipping(raw_frame, low, high)
+    transformed = apply_display_transform(clipped, transform_mode, gamma=gamma)
+    norm = normalize(transformed)
+    display = to_uint8(norm)
 
     return display, low, high
 
@@ -179,7 +177,7 @@ def main() -> None:
     cv2.createTrackbar("Play", WINDOW_NAME, 0, 1, nothing)
     cv2.createTrackbar("FPS", WINDOW_NAME, 25, 100, nothing)
 
-    cv2.createTrackbar("Mode 0L 1S 2G", WINDOW_NAME, 0, 2, nothing)
+    cv2.createTrackbar("Mode 0L 1S 2G 3A", WINDOW_NAME, 0, 3, nothing)
     cv2.createTrackbar("Scale 0A 1G 2M", WINDOW_NAME, 0, 2, nothing)
 
     cv2.createTrackbar("Min % x10", WINDOW_NAME, 10, 999, nothing)      # default 1.0%
@@ -218,7 +216,7 @@ def main() -> None:
         # (può succedere con file a singolo frame dove _tb_max=1 ma n_frames=1).
         current_frame = min(current_frame, n_frames - 1)
 
-        transform_mode = mode_from_trackbar(cv2.getTrackbarPos("Mode 0L 1S 2G", WINDOW_NAME))
+        transform_mode = mode_from_trackbar(cv2.getTrackbarPos("Mode 0L 1S 2G 3A", WINDOW_NAME))
         scale_mode = scale_mode_from_trackbar(cv2.getTrackbarPos("Scale 0A 1G 2M", WINDOW_NAME))
 
         p_min = cv2.getTrackbarPos("Min % x10", WINDOW_NAME) / 10.0
@@ -255,7 +253,7 @@ def main() -> None:
             gamma=gamma,
         )
 
-        mode_name = {0: "LINEAR", 1: "SQRT", 2: "LOG"}[transform_mode]
+        mode_name = {0: "LINEAR", 1: "SQRT", 2: "LOG", 3: "ASINH"}[transform_mode]
         scale_name = {0: "AUTO", 1: "GLOBAL", 2: "MANUAL"}[scale_mode]
 
         overlay = cv2.cvtColor(display_frame, cv2.COLOR_GRAY2BGR)
