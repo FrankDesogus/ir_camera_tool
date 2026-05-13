@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QButtonGroup,
+    QCheckBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -63,7 +64,11 @@ from PySide6.QtWidgets import (
 
 from nvf_reader import NVFData, import_nvf
 from roi import ROI, ROIManager, calculate_roi_timeseries
-from display_pipeline import prepare_frame_for_display
+from display_pipeline import (
+    apply_motion_subtraction,
+    compute_background_sampled,
+    prepare_frame_for_display,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +131,14 @@ class ImageCanvas(QWidget):
         self.setMinimumSize(320, 240)
         self.setStyleSheet("background-color: black;")
 
+        # Stato zoom/pan
+        # _zoom: fattore di ingrandimento (1.0 = immagine intera, 2.0 = 2x, ecc.)
+        # _view_cx/_view_cy: coordinate immagine al centro del widget (pan center)
+        self._zoom: float = 1.0
+        self._view_cx: float = 320.0
+        self._view_cy: float = 256.0
+        self._pan_last: tuple[int, int] | None = None   # ultima posizione durante il drag pan
+
     def set_base_frame(self, bgr: np.ndarray, raw_frame: np.ndarray) -> None:
         """
         Aggiorna il frame da visualizzare. Va chiamato ogni volta che cambia
@@ -133,28 +146,35 @@ class ImageCanvas(QWidget):
         Scatena un repaint (update()).
         """
         h, w = bgr.shape[:2]
-        self._img_w, self._img_h = w, h
+        if w != self._img_w or h != self._img_h:
+            self._img_w, self._img_h = w, h
+            self.reset_zoom()   # se cambiano le dimensioni, azzera lo zoom
         self._base_bgr = bgr
         self._raw_frame = raw_frame
         self.update()   # chiede a Qt di ridisegnare il widget
 
     # --- calcolo della geometria letterbox ---
 
-    def _layout(self) -> tuple[float, int, int]:
+    def _layout(self) -> tuple[float, float, float]:
         """
-        Calcola i parametri di layout letterbox per il widget corrente.
+        Calcola i parametri di trasformazione immagine→widget, tenendo conto
+        del livello di zoom corrente e del centro di visione (pan).
 
-        Restituisce (scala, offset_x, offset_y):
-          scala    — fattore di scala uniforme (< 1 se il widget è più piccolo del frame)
-          offset_x — spazio orizzontale libero a sinistra dell'immagine scalata
-          offset_y — spazio verticale libero sopra l'immagine scalata
+        Restituisce (scala_effettiva, offset_x, offset_y):
+          scala_effettiva — pixel widget per pixel immagine (include zoom)
+          offset_x        — coordinata widget dell'angolo in alto a sinistra dell'immagine
+                            (può essere negativa quando si è zoomati)
+          offset_y        — stessa cosa sull'asse Y
+
+        Formula:
+          widget_x = (img_x - _view_cx) * scala_effettiva + widget_w/2
+          img_x    = (widget_x - widget_w/2) / scala_effettiva + _view_cx
         """
-        scale = min(self.width() / self._img_w, self.height() / self._img_h)
-        dw = int(self._img_w * scale)
-        dh = int(self._img_h * scale)
-        ox = (self.width()  - dw) // 2
-        oy = (self.height() - dh) // 2
-        return scale, ox, oy
+        base_scale = min(self.width() / self._img_w, self.height() / self._img_h)
+        eff_scale  = base_scale * self._zoom
+        ox = self.width()  / 2 - self._view_cx * eff_scale
+        oy = self.height() / 2 - self._view_cy * eff_scale
+        return eff_scale, ox, oy
 
     def _to_image(self, px: int, py: int) -> tuple[int, int] | None:
         """
@@ -196,17 +216,70 @@ class ImageCanvas(QWidget):
 
         painter = QPainter(self)
         painter.fillRect(self.rect(), Qt.GlobalColor.black)   # sfondo nero (letterbox)
-        painter.drawPixmap(ox, oy, dw, dh, _bgr_to_qpixmap(bgr))
+        painter.drawPixmap(int(ox), int(oy), dw, dh, _bgr_to_qpixmap(bgr))
+
+        # Indicatore zoom (solo quando ingrandito)
+        if self._zoom > 1.005:
+            painter.setPen(Qt.GlobalColor.white)
+            painter.drawText(8, 18, f"×{self._zoom:.1f}  (tasto 0 o doppio clic destro per reset)")
+
         painter.end()
+
+    # --- zoom/pan ---
+
+    def reset_zoom(self) -> None:
+        """Riporta zoom a 1x e centra la vista sull'immagine."""
+        self._zoom    = 1.0
+        self._view_cx = self._img_w / 2.0
+        self._view_cy = self._img_h / 2.0
+        self.update()
+
+    def wheelEvent(self, event) -> None:
+        """
+        Rotella del mouse → zoom centrato sulla posizione del cursore.
+        Ogni step ±120 corrisponde a ×1.25 / ÷1.25.
+        Zoom minimo: 1.0 (immagine intera). Massimo: 32x.
+        """
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+
+        factor   = 1.25 if delta > 0 else 1.0 / 1.25
+        new_zoom = max(1.0, min(32.0, self._zoom * factor))
+        if new_zoom == self._zoom:
+            return
+
+        px, py = int(event.position().x()), int(event.position().y())
+        scale, ox, oy = self._layout()
+
+        # Coordinate immagine sotto il cursore (prima del cambio zoom)
+        img_x = (px - ox) / scale
+        img_y = (py - oy) / scale
+
+        # Nuovo centro di vista che mantiene il punto sotto il cursore fisso:
+        # px = (img_x - new_view_cx) * new_eff_scale + widget_w/2
+        # → new_view_cx = img_x - (px - widget_w/2) / new_eff_scale
+        base_scale  = min(self.width() / self._img_w, self.height() / self._img_h)
+        new_eff     = base_scale * new_zoom
+        new_view_cx = img_x - (px - self.width()  / 2) / new_eff
+        new_view_cy = img_y - (py - self.height() / 2) / new_eff
+
+        self._zoom    = new_zoom
+        self._view_cx = max(0.0, min(float(self._img_w), new_view_cx))
+        self._view_cy = max(0.0, min(float(self._img_h), new_view_cy))
+        self.update()
 
     # --- eventi mouse: traduzione Qt → costanti OpenCV → ROIManager ---
 
     def mousePressEvent(self, event) -> None:
         """
-        Tasto sinistro premuto → invia EVENT_LBUTTONDOWN al ROIManager
-        con le coordinate convertite in spazio immagine.
-        Ignora i clic fuori dall'area dell'immagine scalata.
+        Tasto sinistro → disegno ROI.
+        Tasto destro   → inizio pan (drag per spostare la vista quando si è zoomati).
         """
+        if event.button() == Qt.MouseButton.RightButton:
+            self._pan_last = (int(event.position().x()), int(event.position().y()))
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            return
         if self.roi_manager is None:
             return
         if event.button() == Qt.MouseButton.LeftButton:
@@ -216,11 +289,23 @@ class ImageCanvas(QWidget):
 
     def mouseMoveEvent(self, event) -> None:
         """
-        Movimento mouse → aggiorna l'anteprima drag nel ROIManager e
-        emette il segnale mouse_moved con la posizione e il valore grezzo.
-        Il clamping permette di trascinare fuori bordo senza perdere l'evento.
+        Movimento mouse → pan (se tasto destro tenuto) oppure aggiornamento
+        anteprima ROI e segnale mouse_moved.
         """
         px, py = int(event.position().x()), int(event.position().y())
+
+        # Pan: tasto destro tenuto premuto
+        if self._pan_last is not None:
+            dx = px - self._pan_last[0]
+            dy = py - self._pan_last[1]
+            scale, _, _ = self._layout()
+            # Sposta il centro vista nella direzione opposta al drag
+            self._view_cx = max(0.0, min(float(self._img_w), self._view_cx - dx / scale))
+            self._view_cy = max(0.0, min(float(self._img_h), self._view_cy - dy / scale))
+            self._pan_last = (px, py)
+            self.update()
+            return
+
         if self.roi_manager is not None:
             ix, iy = self._clamp_to_image(px, py)
             self.roi_manager.handle_mouse(cv2.EVENT_MOUSEMOVE, ix, iy, 0, None)
@@ -230,9 +315,13 @@ class ImageCanvas(QWidget):
 
     def mouseReleaseEvent(self, event) -> None:
         """
-        Tasto sinistro rilasciato → finalizza la ROI nel ROIManager e
-        emette il segnale roi_finalized per aggiornare la lista ROI nella GUI.
+        Tasto destro rilasciato → termina pan.
+        Tasto sinistro rilasciato → finalizza la ROI.
         """
+        if event.button() == Qt.MouseButton.RightButton:
+            self._pan_last = None
+            self.unsetCursor()
+            return
         if self.roi_manager is None:
             return
         if event.button() == Qt.MouseButton.LeftButton:
@@ -242,6 +331,11 @@ class ImageCanvas(QWidget):
             self.roi_manager.handle_mouse(cv2.EVENT_LBUTTONUP, ix, iy, 0, None)
             self.roi_finalized.emit()
             self.update()
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        """Doppio clic destro → reset zoom/pan."""
+        if event.button() == Qt.MouseButton.RightButton:
+            self.reset_zoom()
 
 
 # ---------------------------------------------------------------------------
@@ -556,6 +650,97 @@ class DisplayPanel(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# MotionPanel — rilevamento oggetti in movimento via sottrazione background
+# ---------------------------------------------------------------------------
+
+class MotionPanel(QWidget):
+    """
+    Pannello per il rilevamento degli oggetti in movimento tramite sottrazione
+    di background stimato con la mediana di un campione di frame.
+
+    Funzionamento:
+      1. Si campionano N frame distribuiti uniformemente nel video.
+      2. Si calcola la mediana pixel-per-pixel → stima del background statico.
+      3. Si sottrae il background dal frame corrente → restano solo le variazioni.
+      4. Il risultato viene passato alla solita pipeline display.
+
+    Controlli:
+      Abilita         — attiva/disattiva la modalità motion
+      Frames campione — quanti frame campionare per la mediana (più = più preciso
+                        ma più lento al primo calcolo)
+      Modalità        — Assoluto / Solo positivo (caldo) / Solo negativo (freddo)
+      Ricalcola bg    — forza il ricalcolo del background (utile se si cambia
+                        il numero di frame campione)
+    """
+
+    params_changed        = Signal()   # parametri cambiati → serve un refresh
+    background_invalidated = Signal()  # background da ricalcolare
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+
+        self._enabled = QCheckBox("Abilita motion detection")
+        self._enabled.toggled.connect(lambda _: self.params_changed.emit())
+
+        self._n_frames = QSpinBox()
+        self._n_frames.setRange(5, 500)
+        self._n_frames.setValue(50)
+        self._n_frames.setSuffix(" frames")
+        self._n_frames.valueChanged.connect(lambda _: self.background_invalidated.emit())
+
+        self._mode_group = QButtonGroup(self)
+        rb_abs = QRadioButton("Assoluto  |frame − bg|")
+        rb_pos = QRadioButton("Solo positivo  (caldo)")
+        rb_neg = QRadioButton("Solo negativo  (freddo)")
+        rb_abs.setChecked(True)
+        for i, rb in enumerate([rb_abs, rb_pos, rb_neg]):
+            self._mode_group.addButton(rb, i)
+        self._mode_group.idToggled.connect(
+            lambda _id, chk: self.params_changed.emit() if chk else None
+        )
+
+        self._recompute_btn = QPushButton("Ricalcola background")
+        self._recompute_btn.clicked.connect(self.background_invalidated.emit)
+
+        form = QFormLayout(self)
+        form.setContentsMargins(8, 8, 8, 8)
+        form.setVerticalSpacing(6)
+        hdr = QLabel("Motion Detection")
+        hdr.setStyleSheet("font-weight: bold; margin-bottom: 2px;")
+        form.addRow(hdr)
+        form.addRow(self._enabled)
+        form.addRow("Frames campione:", self._n_frames)
+        mode_box = QWidget()
+        ml = QVBoxLayout(mode_box)
+        ml.setContentsMargins(0, 0, 0, 0)
+        ml.setSpacing(2)
+        for rb in [rb_abs, rb_pos, rb_neg]:
+            ml.addWidget(rb)
+        form.addRow("Modalità:", mode_box)
+        form.addRow(self._recompute_btn)
+
+    def reinit(self) -> None:
+        """Reimposta i controlli ai valori di default per un nuovo file."""
+        self._enabled.blockSignals(True)
+        self._n_frames.blockSignals(True)
+        self._enabled.setChecked(False)
+        self._n_frames.setValue(50)
+        btn = self._mode_group.button(0)
+        if btn:
+            btn.setChecked(True)
+        self._enabled.blockSignals(False)
+        self._n_frames.blockSignals(False)
+
+    def get_params(self) -> dict:
+        """Restituisce i parametri correnti del pannello."""
+        return {
+            "enabled":  self._enabled.isChecked(),
+            "n_frames": self._n_frames.value(),
+            "mode":     max(self._mode_group.checkedId(), 0),
+        }
+
+
+# ---------------------------------------------------------------------------
 # ROIPanel — gestione visuale delle ROI
 # ---------------------------------------------------------------------------
 
@@ -825,6 +1010,10 @@ class MainWindow(QMainWindow):
         self._glob_max  = 1.0    # valore massimo assoluto
         self.roi_manager: ROIManager | None = None
 
+        # Cache del background per la motion detection
+        self._background: np.ndarray | None = None   # mediana campionata, shape (H, W)
+        self._bg_n_frames: int = 0                   # n_frames usato per il calcolo
+
         self._build_toolbar()
         self._build_ui()
         self._build_shortcuts()
@@ -882,6 +1071,11 @@ class MainWindow(QMainWindow):
         self._display_panel.params_changed.connect(self._refresh)
         self._tabs.addTab(self._display_panel, "Display")
 
+        self._motion_panel = MotionPanel()
+        self._motion_panel.params_changed.connect(self._refresh)
+        self._motion_panel.background_invalidated.connect(self._on_background_invalidated)
+        self._tabs.addTab(self._motion_panel, "Motion")
+
         rl.addWidget(self._tabs)
         h_splitter.addWidget(right)
         h_splitter.setStretchFactor(0, 1)   # canvas si allarga
@@ -934,6 +1128,7 @@ class MainWindow(QMainWindow):
             ("Z",     self._on_undo_roi),
             ("C",     self._on_clear_rois),
             ("G",     self._on_plot_requested),
+            ("0",     self._canvas.reset_zoom),   # 0 = reset zoom/pan
         ]
         for key, slot in pairs:
             QShortcut(QKeySequence(key), self).activated.connect(slot)
@@ -993,8 +1188,13 @@ class MainWindow(QMainWindow):
         self.roi_manager = ROIManager(fw, fh)
         self._canvas.roi_manager = self.roi_manager
 
+        # Azzera la cache del background (il nuovo file ha frame diversi)
+        self._background    = None
+        self._bg_n_frames   = 0
+
         # Reimposta i pannelli
         self._display_panel.reinit(self._glob_min, self._glob_max)
+        self._motion_panel.reinit()
         self._timeline.reinit(self._n_frames)
         self._timeline.setEnabled(True)
         self._plot_panel.reinit(self._n_frames)
@@ -1018,11 +1218,21 @@ class MainWindow(QMainWindow):
         """
         if self._data_cube is None:
             return
-        p   = self._display_panel.get_params()
-        raw = self._data_cube[self._cur_frame]
+        p     = self._display_panel.get_params()
+        pm    = self._motion_panel.get_params()
+        raw   = self._data_cube[self._cur_frame]
+
+        # Motion detection: sostituisce il frame grezzo con la differenza dal background
+        frame_for_display = raw
+        if pm["enabled"]:
+            n = pm["n_frames"]
+            if self._background is None or self._bg_n_frames != n:
+                self._background  = compute_background_sampled(self._data_cube, n)
+                self._bg_n_frames = n
+            frame_for_display = apply_motion_subtraction(raw, self._background, pm["mode"])
 
         uint8, used_low, used_high = prepare_frame_for_display(
-            raw_frame=raw,
+            raw_frame=frame_for_display,
             transform_mode=p["transform_mode"],
             scale_mode=p["scale_mode"],
             p_min=p["p_min"],
@@ -1039,14 +1249,21 @@ class MainWindow(QMainWindow):
 
         # Aggiorna lista ROI e barra di stato
         self._roi_panel.refresh_list(self.roi_manager.rois if self.roi_manager else [])
-        n_rois = len(self.roi_manager.rois) if self.roi_manager else 0
+        n_rois  = len(self.roi_manager.rois) if self.roi_manager else 0
+        motion_tag = "  |  [MOTION]" if pm["enabled"] else ""
         self._status_frame.setText(
             f"F {self._cur_frame + 1} / {self._n_frames}"
             f"  |  win: {used_low:.1f} → {used_high:.1f}"
             f"  |  ROI: {n_rois}"
+            f"{motion_tag}"
         )
 
     # --- slot ---
+
+    def _on_background_invalidated(self) -> None:
+        """Azzera la cache del background e aggiorna il frame corrente."""
+        self._background = None
+        self._refresh()
 
     def _on_frame_changed(self, idx: int) -> None:
         """Slot collegato a TimelinePanel.frame_changed: aggiorna il frame corrente."""

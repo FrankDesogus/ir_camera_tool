@@ -181,6 +181,60 @@ def scale_mode_from_value(value: int) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Motion detection: background estimation e sottrazione
+# ---------------------------------------------------------------------------
+
+def compute_background_sampled(data_cube: np.ndarray, n_samples: int = 50) -> np.ndarray:
+    """
+    Stima il background del video come mediana di n_samples frame distribuiti
+    uniformemente lungo l'intera durata.
+
+    L'approccio a campionamento evita di caricare l'intero cubo in memoria:
+    anche su video lunghi, 50 frame sono sufficienti per una buona stima
+    purché la scena di fondo sia mediamente stazionaria.
+
+    Parametri:
+      data_cube — array 3D int16 shape (N_frames, H, W)
+      n_samples — numero massimo di frame da usare per la mediana
+
+    Restituisce un array float32 shape (H, W) con il valore background per ogni pixel.
+    """
+    n = data_cube.shape[0]
+    if n <= n_samples:
+        indices = np.arange(n)
+    else:
+        indices = np.linspace(0, n - 1, n_samples, dtype=int)
+    sample = data_cube[indices].astype(np.float32)
+    return np.median(sample, axis=0)   # shape (H, W)
+
+
+def apply_motion_subtraction(
+    raw_frame: np.ndarray,
+    background: np.ndarray,
+    mode: int,
+) -> np.ndarray:
+    """
+    Sottrae il background stimato dal frame corrente per isolare gli oggetti
+    in movimento.
+
+    Modalità disponibili:
+      mode=0  Assoluto  — |frame - bg|         (qualsiasi movimento)
+      mode=1  Positivo  — max(frame - bg, 0)   (oggetti più caldi del background)
+      mode=2  Negativo  — max(bg - frame, 0)   (oggetti più freddi del background)
+
+    Il risultato è un array float32 con valori ≥ 0, che può essere passato
+    direttamente alla pipeline display (clipping/transform/normalize/to_uint8).
+    """
+    diff = raw_frame.astype(np.float32) - background
+    if mode == 0:
+        return np.abs(diff)
+    elif mode == 1:
+        return np.maximum(diff, 0.0)
+    else:
+        return np.maximum(-diff, 0.0)
+
+
+# ---------------------------------------------------------------------------
 # Funzione principale: applica l'intera pipeline in un unico passaggio
 # ---------------------------------------------------------------------------
 
